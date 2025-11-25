@@ -16,8 +16,9 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time
 from typing import Dict, List, Optional
 import requests
 from dotenv import load_dotenv
@@ -30,12 +31,28 @@ class AtlasClusterChecker:
     
     BASE_URL = "https://cloud.mongodb.com/api/atlas/v1.0"
     
-    def __init__(self, public_key: str, private_key: str, project_id: str):
+    def __init__(self, public_key: str, private_key: str, project_id: str, time_filter_start: Optional[str] = None, time_filter_end: Optional[str] = None, cluster_filter: Optional[str] = None):
         self.public_key = public_key
         self.private_key = private_key
         self.project_id = project_id
         self.session = requests.Session()
         self.session.auth = requests.auth.HTTPDigestAuth(public_key, private_key)
+        
+        # Store cluster filter
+        self.cluster_filter = cluster_filter
+        
+        # Parse and store time filters
+        self.time_filter_start = None
+        self.time_filter_end = None
+        if time_filter_start and time_filter_end:
+            try:
+                self.time_filter_start = datetime.strptime(time_filter_start, "%H:%M").time()
+                self.time_filter_end = datetime.strptime(time_filter_end, "%H:%M").time()
+                print(f"Time filter active: {time_filter_start} - {time_filter_end} (UTC)")
+            except ValueError:
+                print(f"Warning: Invalid time format. Expected HH:MM, got: {time_filter_start}, {time_filter_end}")
+                self.time_filter_start = None
+                self.time_filter_end = None
     
     def _get(self, endpoint: str, params: Optional[Dict] = None, raise_on_error: bool = True) -> Optional[Dict]:
         """Make a GET request to Atlas API"""
@@ -115,32 +132,60 @@ class AtlasClusterChecker:
             return None
     
     def calculate_metric_stats_from_single(self, measurement: Dict) -> Dict[str, float]:
-        """Calculate max and avg for a single measurement object"""
+        """Calculate max and avg for a single measurement object with optional time filtering"""
         data_points = []
+        filtered_count = 0
+        total_count = 0
         
         for datapoint in measurement.get("dataPoints", []):
+            total_count += 1
             if datapoint.get("value") is not None:
-                data_points.append(datapoint["value"])
+                # Apply time filter if configured
+                if self._is_within_time_filter(datapoint.get("timestamp", "")):
+                    data_points.append(datapoint["value"])
+                else:
+                    filtered_count += 1
+        
+        result = {"max": None, "avg": None, "data_point_count": len(data_points)}
         
         if not data_points:
-            return {"max": None, "avg": None, "data_point_count": 0}
+            if filtered_count > 0 and self.time_filter_start:
+                result["time_filter_warning"] = True
+                print(f"        Warning: Time filter resulted in no data points ({total_count} total, {filtered_count} filtered out)")
+            return result
         
         max_val = max(data_points)
         avg_val = sum(data_points) / len(data_points)
         
-        return {"max": round(max_val, 2), "avg": round(avg_val, 2), "data_point_count": len(data_points)}
+        result.update({"max": round(max_val, 2), "avg": round(avg_val, 2)})
+        return result
     
     def calculate_metric_stats_from_multiple(self, measurements: List[Dict]) -> Dict[str, float]:
-        """Calculate max and avg by summing multiple metrics at each timestamp"""
+        """Calculate max and avg by summing multiple metrics at each timestamp with optional time filtering"""
+        # Collect all timestamps and apply time filtering
         all_timestamps = set()
+        filtered_count = 0
+        total_count = 0
+        
         for measurement in measurements:
             for datapoint in measurement.get("dataPoints", []):
-                if datapoint.get("timestamp"):
-                    all_timestamps.add(datapoint["timestamp"])
+                timestamp = datapoint.get("timestamp")
+                if timestamp:
+                    total_count += 1
+                    if self._is_within_time_filter(timestamp):
+                        all_timestamps.add(timestamp)
+                    else:
+                        filtered_count += 1
+        
+        result = {"max": None, "avg": None, "data_point_count": 0}
         
         if not all_timestamps:
-            return {"max": None, "avg": None, "data_point_count": 0}
+            if filtered_count > 0 and self.time_filter_start:
+                result["time_filter_warning"] = True
+                print(f"        Warning: Time filter resulted in no data points ({total_count} total, {filtered_count} filtered out)")
+            return result
         
+        # Sum values at each filtered timestamp
         timestamp_sums = {}
         for timestamp in all_timestamps:
             timestamp_sums[timestamp] = 0
@@ -151,12 +196,13 @@ class AtlasClusterChecker:
         
         sums = list(timestamp_sums.values())
         if not sums:
-            return {"max": None, "avg": None, "data_point_count": 0}
+            return result
         
         max_val = max(sums)
         avg_val = sum(sums) / len(sums)
         
-        return {"max": round(max_val, 2), "avg": round(avg_val, 2), "data_point_count": len(sums)}
+        result.update({"max": round(max_val, 2), "avg": round(avg_val, 2), "data_point_count": len(sums)})
+        return result
     
     def collect_metrics(self, cluster: Dict) -> Dict:
         """Collect metrics for a cluster"""
@@ -179,6 +225,7 @@ class AtlasClusterChecker:
             "low_iops_use": None,
             "low_cpu_use": None,
             "low_disk_use": None,
+            "cpu_burstable_tier": None,
             "cpu_tier_limit": None,
             "memory_tier_limit_gb": None,
             "iops_tier_limit": None,
@@ -429,10 +476,17 @@ class AtlasClusterChecker:
         if iops_avg is not None and iops_limit:
             cluster_info["low_iops_use"] = True if iops_avg < iops_limit * 0.75 else None
         
-        # Calculate low_cpu_use: true if cpu_avg_percent < 37
+        # Calculate low_cpu_use with special logic for M10/M20 burstable tiers
         cpu_avg = cluster_info.get("cpu_avg_percent")
         if cpu_avg is not None:
-            cluster_info["low_cpu_use"] = True if cpu_avg < 37 else None
+            # M10/M20 use burstable CPU with 20% baseline, so threshold is 75% of 20% = 15%
+            current_tier = cluster_info.get("tier")
+            if current_tier in ["M10", "M20"]:
+                cluster_info["low_cpu_use"] = True if cpu_avg < 15 else None
+                cluster_info["cpu_burstable_tier"] = True
+            else:
+                cluster_info["low_cpu_use"] = True if cpu_avg < 37 else None
+                cluster_info["cpu_burstable_tier"] = False
         
         return cluster_info
     
@@ -447,6 +501,17 @@ class AtlasClusterChecker:
         
         # Load tier specs once for all clusters
         tier_specs = self.load_tier_specs()
+        
+        # Apply cluster filter if specified
+        if self.cluster_filter:
+            filtered_clusters = []
+            for cluster in clusters:
+                cluster_name = cluster.get("name", "")
+                cluster_id = cluster.get("id", "")
+                if self.cluster_filter in [cluster_id, cluster_name]:
+                    filtered_clusters.append(cluster)
+            clusters = filtered_clusters
+            print(f"Filtered to {len(clusters)} clusters matching '{self.cluster_filter}'")
         
         cluster_list = []
         for idx, cluster in enumerate(clusters, 1):
@@ -535,17 +600,44 @@ Examples:
   python cluster_check.py --project-id 507f1f77bcf86cd799439011 \\
                          --public-key my-public-key \\
                          --private-key my-private-key
+  
+  # Check clusters with business hours metrics only (2 PM to 11:59 PM UTC)
+  python cluster_check.py --project-id 507f1f77bcf86cd799439011 \\
+                         --public-key my-public-key \\
+                         --private-key my-private-key \\
+                         --time-filter-start 14:00 \\
+                         --time-filter-end 23:59
+  
+  # Check clusters with night shift metrics (10 PM to 6 AM UTC - cross-midnight)
+  python cluster_check.py --project-id 507f1f77bcf86cd799439011 \\
+                         --public-key my-public-key \\
+                         --private-key my-private-key \\
+                         --time-filter-start 22:00 \\
+                         --time-filter-end 06:00
+  
+  # Check specific cluster only
+  python cluster_check.py --project-id 507f1f77bcf86cd799439011 \\
+                         --public-key my-public-key \\
+                         --private-key my-private-key \\
+                         --cluster-filter "main-production-cluster"
 
 Environment variables:
   ATLAS_PUBLIC_KEY    MongoDB Atlas public API key
   ATLAS_PRIVATE_KEY   MongoDB Atlas private API key
   ATLAS_PROJECT_ID    MongoDB Atlas project ID
+
+Time filtering:
+  All times are in UTC. The Atlas API returns timestamps in UTC format.
+  Cross-midnight ranges (e.g., 22:00-06:00) are supported natively.
         """
     )
     
     parser.add_argument("--project-id", type=str, default=os.getenv("ATLAS_PROJECT_ID"))
     parser.add_argument("--public-key", type=str, default=os.getenv("ATLAS_PUBLIC_KEY"))
     parser.add_argument("--private-key", type=str, default=os.getenv("ATLAS_PRIVATE_KEY"))
+    parser.add_argument("--time-filter-start", type=str, help="Start time for metrics filtering (HH:MM format, UTC). Example: 14:00")
+    parser.add_argument("--time-filter-end", type=str, help="End time for metrics filtering (HH:MM format, UTC). Example: 23:59. Supports cross-midnight ranges like 22:00-06:00")
+    parser.add_argument("--cluster-filter", type=str, help="Filter to specific cluster (by cluster ID or name). Only process this cluster within the project.")
     
     args = parser.parse_args()
     
@@ -559,8 +651,21 @@ Environment variables:
         print("Error: --private-key is required")
         sys.exit(1)
     
+    # Validate time filter format if provided
+    if args.time_filter_start or args.time_filter_end:
+        if not args.time_filter_start or not args.time_filter_end:
+            print("Error: Both --time-filter-start and --time-filter-end must be provided together")
+            sys.exit(1)
+        
+        time_pattern = re.compile(r'^\d{2}:\d{2}$')
+        if not time_pattern.match(args.time_filter_start) or not time_pattern.match(args.time_filter_end):
+            print("Error: Time filters must be in HH:MM format (e.g., 14:00, 23:59)")
+            sys.exit(1)
+    
     try:
-        checker = AtlasClusterChecker(args.public_key, args.private_key, args.project_id)
+        checker = AtlasClusterChecker(args.public_key, args.private_key, args.project_id, 
+                                    args.time_filter_start, args.time_filter_end, 
+                                    args.cluster_filter)
         results = checker.check_clusters()
         
         # Save results to file

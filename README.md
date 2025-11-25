@@ -52,7 +52,7 @@ export ATLAS_PROJECT_ID="your-project-id"
 
 ### atlas_metadata_collector.py
 
-Collects metadata from all projects in an organization. The script supports both JSON and CSV output formats:
+Collects metadata from all projects in an organization. The script supports both JSON and CSV output formats and optional time-based filtering:
 
 #### JSON Output
 
@@ -75,6 +75,51 @@ python3 atlas_metadata_collector.py \
   --output atlas_metadata.csv
 ```
 
+#### Advanced Filtering Options
+
+**Time-Based Filtering** - Filter metrics to specific hours of the day (all times in UTC):
+
+```bash
+# Business hours only (2 PM to 11:59 PM UTC)
+python3 atlas_metadata_collector.py \
+  --org-id YOUR_ORG_ID \
+  --public-key YOUR_PUBLIC_KEY \
+  --private-key YOUR_PRIVATE_KEY \
+  --time-filter-start 14:00 \
+  --time-filter-end 23:59 \
+  --output business_hours.csv
+
+# Night shift (10 PM to 6 AM UTC - cross-midnight range)
+python3 atlas_metadata_collector.py \
+  --org-id YOUR_ORG_ID \
+  --public-key YOUR_PUBLIC_KEY \
+  --private-key YOUR_PRIVATE_KEY \
+  --time-filter-start 22:00 \
+  --time-filter-end 06:00 \
+  --output night_shift.json
+```
+
+**Project and Cluster Filtering** - Focus on specific projects or clusters:
+
+```bash
+# Process only a specific project
+python3 atlas_metadata_collector.py \
+  --org-id YOUR_ORG_ID \
+  --public-key YOUR_PUBLIC_KEY \
+  --private-key YOUR_PRIVATE_KEY \
+  --project-filter "Production Environment" \
+  --output production.csv
+
+# Process only a specific cluster (requires project filter)
+python3 atlas_metadata_collector.py \
+  --org-id YOUR_ORG_ID \
+  --public-key YOUR_PUBLIC_KEY \
+  --private-key YOUR_PRIVATE_KEY \
+  --project-filter "507f1f77bcf86cd799439012" \
+  --cluster-filter "main-cluster" \
+  --output single_cluster.json
+```
+
 The output format is automatically detected by the file extension (`.json` or `.csv`).
 
 ### cluster_check.py
@@ -92,6 +137,48 @@ Or using environment variables:
 
 ```bash
 python3 cluster_check.py
+```
+
+#### Advanced Filtering for Single Project
+
+**Time-Based Filtering** - Filter metrics to specific hours of the day (all times in UTC):
+
+```bash
+# Business hours analysis
+python3 cluster_check.py \
+  --project-id YOUR_PROJECT_ID \
+  --public-key YOUR_PUBLIC_KEY \
+  --private-key YOUR_PRIVATE_KEY \
+  --time-filter-start 14:00 \
+  --time-filter-end 23:59
+
+# Night shift analysis (cross-midnight range)
+python3 cluster_check.py \
+  --project-id YOUR_PROJECT_ID \
+  --public-key YOUR_PUBLIC_KEY \
+  --private-key YOUR_PRIVATE_KEY \
+  --time-filter-start 22:00 \
+  --time-filter-end 06:00
+```
+
+**Cluster Filtering** - Focus on a specific cluster within the project:
+
+```bash
+# Analyze single cluster only
+python3 cluster_check.py \
+  --project-id YOUR_PROJECT_ID \
+  --public-key YOUR_PUBLIC_KEY \
+  --private-key YOUR_PRIVATE_KEY \
+  --cluster-filter "main-production-cluster"
+
+# Combine cluster and time filtering
+python3 cluster_check.py \
+  --project-id YOUR_PROJECT_ID \
+  --public-key YOUR_PUBLIC_KEY \
+  --private-key YOUR_PRIVATE_KEY \
+  --cluster-filter "analytics-cluster" \
+  --time-filter-start 09:00 \
+  --time-filter-end 17:00
 ```
 
 ## Usage Flags Calculation
@@ -115,6 +202,32 @@ The scripts calculate low usage flags based on tier specifications loaded from `
 ### Tier Specifications
 
 Tier limits (CPU, RAM, IOPS) are loaded from `atlas_aws.csv`, which contains tier specifications. The CSV must have columns: `tier`, `cpu`, `ram`, `connection`, and `iops`. Clusters with tiers not found in the CSV will have `null` values for tier limits and usage flags.
+
+## Time-Based Metrics Filtering
+
+Both scripts now support filtering metrics collection to specific hour ranges within each day:
+
+### Features
+- **UTC Timestamps**: All filtering uses UTC time (Atlas API native format)
+- **Cross-Midnight Support**: Ranges like `22:00-06:00` work natively for night shifts
+- **Warning Messages**: Scripts warn when time filtering results in no data points
+- **Multi-Day Analysis**: Filters apply the same hour range to each day in the collection period
+- **Project Filtering**: Process only specific projects by name or ID
+- **Cluster Filtering**: Focus on individual clusters (requires project filter for organization-wide script)
+
+### Usage Examples
+- `--time-filter-start 09:00 --time-filter-end 17:00` - Standard business hours
+- `--time-filter-start 14:00 --time-filter-end 23:59` - Afternoon/evening peak hours  
+- `--time-filter-start 22:00 --time-filter-end 06:00` - Night shift (cross-midnight)
+- `--time-filter-start 00:00 --time-filter-end 08:00` - Early morning hours
+
+### Important Notes
+- Both start and end times must be provided together for time filtering
+- Time format must be `HH:MM` (24-hour format) 
+- Without filters, all projects/clusters/timestamps are processed
+- Project/cluster filters match by either ID or name (case-sensitive)
+- Cluster filtering requires project filtering (for `atlas_metadata_collector.py`)
+- Filtering occurs before metric aggregation (max/avg calculations)
 
 ## Getting MongoDB Atlas Credentials
 

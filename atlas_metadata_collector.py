@@ -18,8 +18,9 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time
 from typing import Dict, List, Optional
 import requests
 from dotenv import load_dotenv
@@ -126,28 +127,78 @@ class AtlasAPIClient:
 class AtlasMetadataCollector:
     """Collects comprehensive metadata from MongoDB Atlas"""
     
-    def __init__(self, public_key: str, private_key: str, org_id: str):
+    def __init__(self, public_key: str, private_key: str, org_id: str, time_filter_start: Optional[str] = None, time_filter_end: Optional[str] = None, project_filter: Optional[str] = None, cluster_filter: Optional[str] = None):
         self.client = AtlasAPIClient(public_key, private_key, org_id)
+        
+        # Store project and cluster filters
+        self.project_filter = project_filter
+        self.cluster_filter = cluster_filter
+        
+        # Parse and store time filters
+        self.time_filter_start = None
+        self.time_filter_end = None
+        if time_filter_start and time_filter_end:
+            try:
+                self.time_filter_start = datetime.strptime(time_filter_start, "%H:%M").time()
+                self.time_filter_end = datetime.strptime(time_filter_end, "%H:%M").time()
+                print(f"Time filter active: {time_filter_start} - {time_filter_end} (UTC)")
+            except ValueError:
+                print(f"Warning: Invalid time format. Expected HH:MM, got: {time_filter_start}, {time_filter_end}")
+                self.time_filter_start = None
+                self.time_filter_end = None
+    
+    def _is_within_time_filter(self, timestamp: str) -> bool:
+        """Check if timestamp falls within the configured time filter range (UTC)"""
+        if not self.time_filter_start or not self.time_filter_end:
+            return True  # No filter configured, include all timestamps
+        
+        try:
+            # Parse ISO 8601 UTC timestamp and extract time component
+            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            current_time = dt.time()
+            
+            # Handle cross-midnight ranges (e.g., 22:00-06:00)
+            if self.time_filter_start > self.time_filter_end:
+                # Cross-midnight: include times >= start OR <= end
+                return current_time >= self.time_filter_start or current_time <= self.time_filter_end
+            else:
+                # Normal range: include times >= start AND <= end
+                return self.time_filter_start <= current_time <= self.time_filter_end
+        except Exception:
+            return True  # Include timestamp if parsing fails
     
     def calculate_metric_stats_from_single(self, measurement: Dict) -> Dict[str, float]:
-        """Calculate max and avg for a single measurement object"""
+        """Calculate max and avg for a single measurement object with optional time filtering"""
         data_points = []
+        filtered_count = 0
+        total_count = 0
         
         for datapoint in measurement.get("dataPoints", []):
+            total_count += 1
             if datapoint.get("value") is not None:
-                data_points.append(datapoint["value"])
+                # Apply time filter if configured
+                if self._is_within_time_filter(datapoint.get("timestamp", "")):
+                    data_points.append(datapoint["value"])
+                else:
+                    filtered_count += 1
+        
+        result = {"max": None, "avg": None, "data_point_count": len(data_points)}
         
         if not data_points:
-            return {"max": None, "avg": None, "data_point_count": 0}
+            if filtered_count > 0 and self.time_filter_start:
+                result["time_filter_warning"] = True
+                print(f"        Warning: Time filter resulted in no data points ({total_count} total, {filtered_count} filtered out)")
+            return result
         
         max_val = max(data_points)
         avg_val = sum(data_points) / len(data_points)
         
-        return {"max": round(max_val, 2), "avg": round(avg_val, 2), "data_point_count": len(data_points)}
+        result.update({"max": round(max_val, 2), "avg": round(avg_val, 2)})
+        return result
     
     def calculate_metric_stats_from_multiple(self, measurements: List[Dict]) -> Dict[str, float]:
         """
-        Calculate max and avg by summing multiple metrics at each timestamp
+        Calculate max and avg by summing multiple metrics at each timestamp with optional time filtering
         
         Args:
             measurements: List of measurement dictionaries with dataPoints
@@ -155,17 +206,30 @@ class AtlasMetadataCollector:
         Returns:
             Dictionary with max, avg, and data_point_count
         """
-        # Collect all timestamps
+        # Collect all timestamps and apply time filtering
         all_timestamps = set()
+        filtered_count = 0
+        total_count = 0
+        
         for measurement in measurements:
             for datapoint in measurement.get("dataPoints", []):
-                if datapoint.get("timestamp"):
-                    all_timestamps.add(datapoint["timestamp"])
+                timestamp = datapoint.get("timestamp")
+                if timestamp:
+                    total_count += 1
+                    if self._is_within_time_filter(timestamp):
+                        all_timestamps.add(timestamp)
+                    else:
+                        filtered_count += 1
+        
+        result = {"max": None, "avg": None, "data_point_count": 0}
         
         if not all_timestamps:
-            return {"max": None, "avg": None, "data_point_count": 0}
+            if filtered_count > 0 and self.time_filter_start:
+                result["time_filter_warning"] = True
+                print(f"        Warning: Time filter resulted in no data points ({total_count} total, {filtered_count} filtered out)")
+            return result
         
-        # Sum values at each timestamp
+        # Sum values at each filtered timestamp
         timestamp_sums = {}
         for timestamp in all_timestamps:
             timestamp_sums[timestamp] = 0
@@ -176,12 +240,13 @@ class AtlasMetadataCollector:
         
         sums = list(timestamp_sums.values())
         if not sums:
-            return {"max": None, "avg": None, "data_point_count": 0}
+            return result
         
         max_val = max(sums)
         avg_val = sum(sums) / len(sums)
         
-        return {"max": round(max_val, 2), "avg": round(avg_val, 2), "data_point_count": len(sums)}
+        result.update({"max": round(max_val, 2), "avg": round(avg_val, 2), "data_point_count": len(sums)})
+        return result
     
     def load_tier_specs(self) -> Dict:
         """Load tier specifications from CSV file"""
@@ -233,10 +298,17 @@ class AtlasMetadataCollector:
         if iops_avg is not None and iops_limit:
             metadata["low_iops_use"] = True if iops_avg < iops_limit * 0.75 else None
         
-        # Calculate low_cpu_use: true if cpu_avg_percent < 37
+        # Calculate low_cpu_use with special logic for M10/M20 burstable tiers
         cpu_avg = metadata.get("cpu_avg_percent")
         if cpu_avg is not None:
-            metadata["low_cpu_use"] = True if cpu_avg < 37 else None
+            # M10/M20 use burstable CPU with 20% baseline, so threshold is 75% of 20% = 15%
+            current_tier = metadata.get("tier")
+            if current_tier in ["M10", "M20", "M30"]: # lower tier of M30 is M20, which is burstable
+                metadata["low_cpu_use"] = True if cpu_avg < 15 else None
+                metadata["cpu_burstable_tier"] = True
+            else:
+                metadata["low_cpu_use"] = True if cpu_avg < 37 else None
+                metadata["cpu_burstable_tier"] = False
         
         return metadata
     
@@ -312,6 +384,7 @@ class AtlasMetadataCollector:
             "low_iops_use": None,
             "low_cpu_use": None,
             "low_disk_use": None,
+            "cpu_burstable_tier": None,
             "cpu_tier_limit": None,
             "memory_tier_limit_gb": None,
             "iops_tier_limit": None,
@@ -555,6 +628,10 @@ class AtlasMetadataCollector:
             project_id = project["id"]
             project_name = project.get("name", "Unknown")
             
+            # Apply project filter if specified
+            if self.project_filter and self.project_filter not in [project_id, project_name]:
+                continue
+            
             print(f"Processing project: {project_name} ({project_id})")
             
             clusters = self.client.get_clusters(project_id)
@@ -562,6 +639,13 @@ class AtlasMetadataCollector:
             
             cluster_metadata = []
             for cluster in clusters:
+                cluster_name = cluster.get("name", "")
+                cluster_id = cluster.get("id", "")
+                
+                # Apply cluster filter if specified
+                if self.cluster_filter and self.cluster_filter not in [cluster_id, cluster_name]:
+                    continue
+                
                 try:
                     metadata = self.collect_cluster_metadata(project_id, cluster)
                     cluster_metadata.append(metadata)
@@ -592,11 +676,46 @@ Examples:
                                      --public-key my-public-key \\
                                      --private-key my-private-key \\
                                      --output results.json
+  
+  # Filter metrics to business hours only (2 PM to 11:59 PM UTC)
+  python atlas_metadata_collector.py --org-id 507f1f77bcf86cd799439011 \\
+                                     --public-key my-public-key \\
+                                     --private-key my-private-key \\
+                                     --time-filter-start 14:00 \\
+                                     --time-filter-end 23:59 \\
+                                     --output business_hours.csv
+  
+  # Filter metrics to night shift (10 PM to 6 AM UTC - cross-midnight)
+  python atlas_metadata_collector.py --org-id 507f1f77bcf86cd799439011 \\
+                                     --public-key my-public-key \\
+                                     --private-key my-private-key \\
+                                     --time-filter-start 22:00 \\
+                                     --time-filter-end 06:00 \\
+                                     --output night_shift.json
+  
+  # Filter to specific project only
+  python atlas_metadata_collector.py --org-id 507f1f77bcf86cd799439011 \\
+                                     --public-key my-public-key \\
+                                     --private-key my-private-key \\
+                                     --project-filter "Production Project" \\
+                                     --output prod_project.csv
+  
+  # Filter to specific cluster in specific project
+  python atlas_metadata_collector.py --org-id 507f1f77bcf86cd799439011 \\
+                                     --public-key my-public-key \\
+                                     --private-key my-private-key \\
+                                     --project-filter "507f1f77bcf86cd799439012" \\
+                                     --cluster-filter "main-cluster" \\
+                                     --output single_cluster.json
 
 Environment variables:
   ATLAS_PUBLIC_KEY    MongoDB Atlas public API key
   ATLAS_PRIVATE_KEY   MongoDB Atlas private API key
   ATLAS_ORG_ID        MongoDB Atlas organization ID
+
+Time filtering:
+  All times are in UTC. The Atlas API returns timestamps in UTC format.
+  Cross-midnight ranges (e.g., 22:00-06:00) are supported natively.
         """
     )
     
@@ -605,6 +724,10 @@ Environment variables:
     parser.add_argument("--private-key", type=str, default=os.getenv("ATLAS_PRIVATE_KEY"))
     parser.add_argument("--output", type=str, default="atlas_metadata.json")
     parser.add_argument("--pretty", action="store_true")
+    parser.add_argument("--time-filter-start", type=str, help="Start time for metrics filtering (HH:MM format, UTC). Example: 14:00")
+    parser.add_argument("--time-filter-end", type=str, help="End time for metrics filtering (HH:MM format, UTC). Example: 23:59. Supports cross-midnight ranges like 22:00-06:00")
+    parser.add_argument("--project-filter", type=str, help="Filter to specific project (by project ID or name). Only process this project.")
+    parser.add_argument("--cluster-filter", type=str, help="Filter to specific cluster (by cluster ID or name). Requires --project-filter to be specified.")
     
     args = parser.parse_args()
     
@@ -618,8 +741,26 @@ Environment variables:
         print("Error: --private-key is required")
         sys.exit(1)
     
+    # Validate time filter format if provided
+    if args.time_filter_start or args.time_filter_end:
+        if not args.time_filter_start or not args.time_filter_end:
+            print("Error: Both --time-filter-start and --time-filter-end must be provided together")
+            sys.exit(1)
+        
+        time_pattern = re.compile(r'^\d{2}:\d{2}$')
+        if not time_pattern.match(args.time_filter_start) or not time_pattern.match(args.time_filter_end):
+            print("Error: Time filters must be in HH:MM format (e.g., 14:00, 23:59)")
+            sys.exit(1)
+    
+    # Validate cluster filter requires project filter
+    if args.cluster_filter and not args.project_filter:
+        print("Error: --cluster-filter requires --project-filter to be specified")
+        sys.exit(1)
+    
     try:
-        collector = AtlasMetadataCollector(args.public_key, args.private_key, args.org_id)
+        collector = AtlasMetadataCollector(args.public_key, args.private_key, args.org_id, 
+                                         args.time_filter_start, args.time_filter_end,
+                                         args.project_filter, args.cluster_filter)
         results = collector.collect_all_metadata()
         
         # Detect output format based on file extension
@@ -649,7 +790,7 @@ Environment variables:
                     'read_ops_max', 'read_ops_avg', 'write_ops_max', 'write_ops_avg',
                     'disk_usage_max_gb', 'disk_available_max_gb',
                     'cpu_tier_limit', 'memory_tier_limit_gb', 'iops_tier_limit',
-                    'low_cpu_use', 'low_memory_use', 'low_iops_use', 'low_disk_use'
+                    'low_cpu_use', 'low_memory_use', 'low_iops_use', 'low_disk_use', 'cpu_burstable_tier'
                 ])
                 
                 # Write cluster data
@@ -692,7 +833,8 @@ Environment variables:
                             cluster.get("low_cpu_use"),
                             cluster.get("low_memory_use"),
                             cluster.get("low_iops_use"),
-                            cluster.get("low_disk_use")
+                            cluster.get("low_disk_use"),
+                            cluster.get("cpu_burstable_tier")
                         ])
         else:
             # Default to JSON if extension is not recognized
