@@ -193,8 +193,14 @@ The scripts calculate low usage flags based on tier specifications loaded from `
 - **`low_memory_use`**: `true` if `memory_max_gb < memory_tier_limit_gb * 0.75`
   - Compares maximum memory usage against 75% of compare tier's RAM limit
   
-- **`low_cpu_use`**: `true` if `cpu_avg_percent < 37`
-  - Flags clusters with average CPU usage below 37%
+- **`low_cpu_use`**: `true` if `cpu_avg_percent < 37` (standard tiers) or `cpu_avg_percent < 15` (M10/M20 burstable tiers)
+  - Flags clusters with average CPU usage below threshold
+  - M10/M20 tiers use burstable CPU with 20% baseline, so threshold is 75% of baseline = 15%
+  - All other tiers use 37% threshold based on standard CPU performance
+  
+- **`cpu_burstable_lower_tier`**: `true` for M10/M20 clusters, `false` for all other tiers
+  - Indicates whether the cluster uses MongoDB Atlas burstable CPU performance
+  - Burstable tiers (M10/M20) have different CPU baseline calculations than dedicated tiers
   
 - **`low_disk_use`**: `true` if `disk_usage_max_gb < disk_size_gb * 0.3`
   - Flags clusters using less than 30% of their allocated disk space
@@ -202,6 +208,8 @@ The scripts calculate low usage flags based on tier specifications loaded from `
 ### Tier Specifications
 
 Tier limits (CPU, RAM, IOPS) are loaded from `atlas_aws.csv`, which contains tier specifications. The CSV must have columns: `tier`, `cpu`, `ram`, `connection`, and `iops`. Clusters with tiers not found in the CSV will have `null` values for tier limits and usage flags.
+
+**Burstable CPU Tiers**: M10 and M20 clusters use MongoDB Atlas burstable CPU performance with a 20% baseline. The scripts automatically detect these tiers and apply the appropriate CPU threshold (15% instead of 37%) for low usage calculations.
 
 ## Time-Based Metrics Filtering
 

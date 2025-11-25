@@ -305,10 +305,10 @@ class AtlasMetadataCollector:
             current_tier = metadata.get("tier")
             if current_tier in ["M10", "M20", "M30"]: # lower tier of M30 is M20, which is burstable
                 metadata["low_cpu_use"] = True if cpu_avg < 15 else None
-                metadata["cpu_burstable_tier"] = True
+                metadata["cpu_burstable_lower_tier"] = True
             else:
                 metadata["low_cpu_use"] = True if cpu_avg < 37 else None
-                metadata["cpu_burstable_tier"] = False
+                metadata["cpu_burstable_lower_tier"] = False
         
         return metadata
     
@@ -384,7 +384,7 @@ class AtlasMetadataCollector:
             "low_iops_use": None,
             "low_cpu_use": None,
             "low_disk_use": None,
-            "cpu_burstable_tier": None,
+            "cpu_burstable_lower_tier": None,
             "cpu_tier_limit": None,
             "memory_tier_limit_gb": None,
             "iops_tier_limit": None,
@@ -790,7 +790,7 @@ Time filtering:
                     'read_ops_max', 'read_ops_avg', 'write_ops_max', 'write_ops_avg',
                     'disk_usage_max_gb', 'disk_available_max_gb',
                     'cpu_tier_limit', 'memory_tier_limit_gb', 'iops_tier_limit',
-                    'low_cpu_use', 'low_memory_use', 'low_iops_use', 'low_disk_use', 'cpu_burstable_tier'
+                    'low_cpu_use', 'low_memory_use', 'low_iops_use', 'low_disk_use', 'cpu_burstable_lower_tier'
                 ])
                 
                 # Write cluster data
@@ -834,7 +834,7 @@ Time filtering:
                             cluster.get("low_memory_use"),
                             cluster.get("low_iops_use"),
                             cluster.get("low_disk_use"),
-                            cluster.get("cpu_burstable_tier")
+                            cluster.get("cpu_burstable_lower_tier")
                         ])
         else:
             # Default to JSON if extension is not recognized

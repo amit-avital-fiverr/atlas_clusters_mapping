@@ -225,7 +225,7 @@ class AtlasClusterChecker:
             "low_iops_use": None,
             "low_cpu_use": None,
             "low_disk_use": None,
-            "cpu_burstable_tier": None,
+            "cpu_burstable_lower_tier": None,
             "cpu_tier_limit": None,
             "memory_tier_limit_gb": None,
             "iops_tier_limit": None,
@@ -483,10 +483,10 @@ class AtlasClusterChecker:
             current_tier = cluster_info.get("tier")
             if current_tier in ["M10", "M20"]:
                 cluster_info["low_cpu_use"] = True if cpu_avg < 15 else None
-                cluster_info["cpu_burstable_tier"] = True
+                cluster_info["cpu_burstable_lower_tier"] = True
             else:
                 cluster_info["low_cpu_use"] = True if cpu_avg < 37 else None
-                cluster_info["cpu_burstable_tier"] = False
+                cluster_info["cpu_burstable_lower_tier"] = False
         
         return cluster_info
     
