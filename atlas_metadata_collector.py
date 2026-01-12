@@ -22,6 +22,7 @@ import re
 import sys
 from datetime import datetime, timezone, time
 from typing import Dict, List, Optional
+import numpy as np
 import requests
 from dotenv import load_dotenv
 
@@ -168,7 +169,7 @@ class AtlasMetadataCollector:
             return True  # Include timestamp if parsing fails
     
     def calculate_metric_stats_from_single(self, measurement: Dict) -> Dict[str, float]:
-        """Calculate max and avg for a single measurement object with optional time filtering"""
+        """Calculate max, avg, and p95 for a single measurement object with optional time filtering"""
         data_points = []
         filtered_count = 0
         total_count = 0
@@ -182,7 +183,7 @@ class AtlasMetadataCollector:
                 else:
                     filtered_count += 1
         
-        result = {"max": None, "avg": None, "data_point_count": len(data_points)}
+        result = {"max": None, "avg": None, "p95": None, "data_point_count": len(data_points)}
         
         if not data_points:
             if filtered_count > 0 and self.time_filter_start:
@@ -192,19 +193,20 @@ class AtlasMetadataCollector:
         
         max_val = max(data_points)
         avg_val = sum(data_points) / len(data_points)
+        p95_val = float(np.percentile(data_points, 95))
         
-        result.update({"max": round(max_val, 2), "avg": round(avg_val, 2)})
+        result.update({"max": round(max_val, 2), "avg": round(avg_val, 2), "p95": round(p95_val, 2)})
         return result
     
     def calculate_metric_stats_from_multiple(self, measurements: List[Dict]) -> Dict[str, float]:
         """
-        Calculate max and avg by summing multiple metrics at each timestamp with optional time filtering
+        Calculate max, avg, and p95 by summing multiple metrics at each timestamp with optional time filtering
         
         Args:
             measurements: List of measurement dictionaries with dataPoints
             
         Returns:
-            Dictionary with max, avg, and data_point_count
+            Dictionary with max, avg, p95, and data_point_count
         """
         # Collect all timestamps and apply time filtering
         all_timestamps = set()
@@ -221,7 +223,7 @@ class AtlasMetadataCollector:
                     else:
                         filtered_count += 1
         
-        result = {"max": None, "avg": None, "data_point_count": 0}
+        result = {"max": None, "avg": None, "p95": None, "data_point_count": 0}
         
         if not all_timestamps:
             if filtered_count > 0 and self.time_filter_start:
@@ -244,8 +246,9 @@ class AtlasMetadataCollector:
         
         max_val = max(sums)
         avg_val = sum(sums) / len(sums)
+        p95_val = float(np.percentile(sums, 95))
         
-        result.update({"max": round(max_val, 2), "avg": round(avg_val, 2), "data_point_count": len(sums)})
+        result.update({"max": round(max_val, 2), "avg": round(avg_val, 2), "p95": round(p95_val, 2), "data_point_count": len(sums)})
         return result
     
     def load_tier_specs(self) -> Dict:
@@ -266,6 +269,205 @@ class AtlasMetadataCollector:
         except FileNotFoundError:
             print("Warning: tier specs file not found")
         return tier_specs
+    
+    def _empty_metrics_dict(self) -> Dict:
+        """Return a dictionary with all metrics fields set to None"""
+        return {
+            "cpu_max_percent": None,
+            "cpu_avg_percent": None,
+            "cpu_p95_percent": None,
+            "memory_max_gb": None,
+            "memory_avg_gb": None,
+            "memory_p95_gb": None,
+            "iops_max": None,
+            "iops_avg": None,
+            "iops_p95": None,
+            "connections_max": None,
+            "connections_avg": None,
+            "connections_p95": None,
+            "read_ops_max": None,
+            "read_ops_avg": None,
+            "read_ops_p95": None,
+            "write_ops_max": None,
+            "write_ops_avg": None,
+            "write_ops_p95": None,
+            "disk_usage_max_gb": None,
+            "disk_available_max_gb": None,
+            "low_memory_use": None,
+            "low_iops_use": None,
+            "low_cpu_use": None,
+            "low_disk_use": None,
+            "cpu_burstable_lower_tier": None,
+            "cpu_tier_limit": None,
+            "memory_tier_limit_gb": None,
+            "iops_tier_limit": None,
+        }
+    
+    def _collect_node_metrics(self, project_id: str, process: Dict, metadata: Dict) -> Dict:
+        """Collect metrics for a single node/process"""
+        process_id = process["id"]
+        process_type = process.get("typeName", "UNKNOWN")
+        hostname = process.get("hostname", "")
+        
+        metadata["node_hostname"] = hostname
+        metadata["node_type"] = process_type
+        metadata.update(self._empty_metrics_dict())
+        
+        print(f"      Collecting metrics for node: {hostname} ({process_type})")
+        
+        try:
+            # Collect CPU metrics - sum multiple metrics
+            cpu_measurements = self.client.get_process_measurements(
+                project_id, process_id, "CPU_USAGE", granularity="PT1M", period="P2D"
+            )
+            if cpu_measurements:
+                cpu_metric_names = [
+                    "SYSTEM_NORMALIZED_CPU_GUEST", "SYSTEM_NORMALIZED_CPU_IOWAIT",
+                    "SYSTEM_NORMALIZED_CPU_IRQ", "SYSTEM_NORMALIZED_CPU_KERNEL",
+                    "SYSTEM_NORMALIZED_CPU_NICE", "SYSTEM_NORMALIZED_CPU_SOFTIRQ",
+                    "SYSTEM_NORMALIZED_CPU_STEAL", "SYSTEM_NORMALIZED_CPU_USER"
+                ]
+                cpu_metrics_to_sum = [
+                    m for m in cpu_measurements.get("measurements", [])
+                    if m.get("name") in cpu_metric_names
+                ]
+                if cpu_metrics_to_sum:
+                    stats = self.calculate_metric_stats_from_multiple(cpu_metrics_to_sum)
+                    if stats["max"] is not None:
+                        metadata["cpu_max_percent"] = stats["max"]
+                        metadata["cpu_avg_percent"] = stats["avg"]
+                        metadata["cpu_p95_percent"] = stats["p95"]
+            
+            # Collect MEMORY metrics
+            memory_measurements = self.client.get_process_measurements(
+                project_id, process_id, "MEMORY", granularity="PT1M", period="P2D"
+            )
+            if memory_measurements:
+                for measurement in memory_measurements.get("measurements", []):
+                    metric_name = measurement.get("name")
+                    if metric_name == "SYSTEM_MEMORY_USED":
+                        stats = self.calculate_metric_stats_from_single(measurement)
+                        if stats["max"] is not None:
+                            # SYSTEM_MEMORY_USED is in KB, convert to GB
+                            metadata["memory_max_gb"] = round(stats["max"] / (1024**2), 2)
+                            metadata["memory_avg_gb"] = round(stats["avg"] / (1024**2), 2)
+                            metadata["memory_p95_gb"] = round(stats["p95"] / (1024**2), 2)
+                            break
+            
+            # Collect DISK and DATABASE_SIZE metrics
+            disk_measurements = self.client.get_process_measurements(
+                project_id, process_id, "DISK", granularity="PT1M", period="P2D"
+            )
+            if disk_measurements:
+                for measurement in disk_measurements.get("measurements", []):
+                    metric_name = measurement.get("name")
+                    if metric_name == "DB_STORAGE_TOTAL":
+                        stats = self.calculate_metric_stats_from_single(measurement)
+                        if stats["max"] is not None:
+                            # Convert bytes to GB
+                            metadata["disk_usage_max_gb"] = round(stats["max"] / (1024**3), 2)
+                            break
+            
+            # Try DATABASE_SIZE for DB_DATA_SIZE_TOTAL
+            db_size_measurements = self.client.get_process_measurements(
+                project_id, process_id, "DATABASE_SIZE", granularity="PT1M", period="P2D"
+            )
+            if db_size_measurements:
+                for measurement in db_size_measurements.get("measurements", []):
+                    metric_name = measurement.get("name")
+                    if metric_name == "DB_DATA_SIZE_TOTAL":
+                        stats = self.calculate_metric_stats_from_single(measurement)
+                        if stats["max"] is not None:
+                             # Convert bytes to GB
+                            if metadata.get("disk_usage_max_gb") is None:
+                                metadata["disk_usage_max_gb"] = round(stats["max"] / (1024**3), 2)
+                            break
+            
+            # Collect IOPS metrics from v2 disk API
+            try:
+                disks = self.client.get_disks(project_id, process_id)
+                if disks:
+                    # Use the first disk partition
+                    disk = disks[0]
+                    partition_name = disk.get("partitionName")
+                    if partition_name:
+                        print(f"      Fetching IOPS from disk {partition_name}...")
+                        iops_measurements = self.client.get_disk_measurements(
+                            project_id, process_id, partition_name, granularity="PT1M", period="P2D"
+                        )
+                        if iops_measurements:
+                            for measurement in iops_measurements.get("measurements", []):
+                                metric_name = measurement.get("name")
+                                if metric_name == "DISK_PARTITION_IOPS_TOTAL":
+                                    stats = self.calculate_metric_stats_from_single(measurement)
+                                    if stats["max"] is not None:
+                                        metadata["iops_max"] = stats["max"]
+                                        metadata["iops_avg"] = stats["avg"]
+                                        metadata["iops_p95"] = stats["p95"]
+                                        break
+            except Exception as e:
+                print(f"        Could not fetch IOPS metrics: {str(e)[:100]}")
+            
+            # Try DATABASE_OPERATIONS metrics for connections and operations
+            op_measurements = self.client.get_process_measurements(
+                project_id, process_id, "DATABASE_OPERATIONS", granularity="PT1M", period="P2D"
+            )
+            if op_measurements:
+                # Connections
+                for measurement in op_measurements.get("measurements", []):
+                    metric_name = measurement.get("name")
+                    if metric_name == "CONNECTIONS":
+                        stats = self.calculate_metric_stats_from_single(measurement)
+                        if stats["max"] is not None:
+                            metadata["connections_max"] = stats["max"]
+                            metadata["connections_avg"] = stats["avg"]
+                            metadata["connections_p95"] = stats["p95"]
+                            break
+                
+                read_op_metric_names = ["OPCOUNTER_CMD", "OPCOUNTER_GETMORE", "OPCOUNTER_QUERY"]
+                read_op_metrics_to_sum = [
+                    m for m in op_measurements.get("measurements", [])
+                    if m.get("name") in read_op_metric_names
+                ]
+                if read_op_metrics_to_sum:
+                    stats = self.calculate_metric_stats_from_multiple(read_op_metrics_to_sum)
+                    if stats["max"] is not None:
+                        metadata["read_ops_max"] = stats["max"]
+                        metadata["read_ops_avg"] = stats["avg"]
+                        metadata["read_ops_p95"] = stats["p95"]
+                
+                write_op_metric_names = ["OPCOUNTER_DELETE", "OPCOUNTER_TTL_DELETED", "OPCOUNTER_INSERT", "OPCOUNTER_UPDATE"]
+                write_op_metrics_to_sum = [
+                    m for m in op_measurements.get("measurements", [])
+                    if m.get("name") in write_op_metric_names
+                ]
+                if write_op_metrics_to_sum:
+                    stats = self.calculate_metric_stats_from_multiple(write_op_metrics_to_sum)
+                    if stats["max"] is not None:
+                        metadata["write_ops_max"] = stats["max"]
+                        metadata["write_ops_avg"] = stats["avg"]
+                        metadata["write_ops_p95"] = stats["p95"]
+        
+        except Exception as e:
+            print(f"        Metrics not available: {str(e)[:100]}")
+        
+        # Calculate disk available if we have both values
+        if metadata.get("disk_size_gb") and metadata.get("disk_usage_max_gb"):
+            metadata["disk_available_max_gb"] = round(
+                metadata["disk_size_gb"] - metadata["disk_usage_max_gb"], 2
+            )
+        
+        # Calculate low_disk_use: true if disk_usage_max_gb < disk_size_gb * 0.3
+        disk_usage_max = metadata.get("disk_usage_max_gb")
+        disk_size = metadata.get("disk_size_gb")
+        if disk_usage_max is not None and disk_size is not None:
+            metadata["low_disk_use"] = True if disk_usage_max < disk_size * 0.3 else None
+        
+        # Calculate usage flags
+        tier_specs = self.load_tier_specs()
+        metadata = self.calculate_usage_flags(metadata, tier_specs)
+        
+        return metadata
     
     def calculate_usage_flags(self, metadata: Dict, tier_specs: Dict) -> Dict:
         """Calculate low usage flags based on tier specifications"""
@@ -293,32 +495,32 @@ class AtlasMetadataCollector:
         if memory_max is not None and ram_limit:
             metadata["low_memory_use"] = True if memory_max < ram_limit * 0.75 else None
         
-        # Calculate low_iops_use: true if iops_avg < 0.75 * iops_tier_limit
-        iops_avg = metadata.get("iops_avg")
-        if iops_avg is not None and iops_limit:
-            metadata["low_iops_use"] = True if iops_avg < iops_limit * 0.75 else None
+        # Calculate low_iops_use: true if iops_p95 < 0.75 * iops_tier_limit
+        iops_p95 = metadata.get("iops_p95")
+        if iops_p95 is not None and iops_limit:
+            metadata["low_iops_use"] = True if iops_p95 < iops_limit * 0.75 else None
         
-        # Calculate low_cpu_use with special logic for M10/M20 burstable tiers
-        cpu_avg = metadata.get("cpu_avg_percent")
-        if cpu_avg is not None:
+        # Calculate low_cpu_use with special logic for M10/M20 burstable tiers (using p95)
+        cpu_p95 = metadata.get("cpu_p95_percent")
+        if cpu_p95 is not None:
             # M10/M20 use burstable CPU with 20% baseline, so threshold is 75% of 20% = 15%
             current_tier = metadata.get("tier")
             if current_tier in ["M10", "M20", "M30"]: # lower tier of M30 is M20, which is burstable
-                metadata["low_cpu_use"] = True if cpu_avg < 15 else None
+                metadata["low_cpu_use"] = True if cpu_p95 < 15 else None
                 metadata["cpu_burstable_lower_tier"] = True
             else:
-                metadata["low_cpu_use"] = True if cpu_avg < 37 else None
+                metadata["low_cpu_use"] = True if cpu_p95 < 37 else None
                 metadata["cpu_burstable_lower_tier"] = False
         
         return metadata
     
-    def collect_cluster_metadata(self, project_id: str, cluster: Dict) -> Dict:
-        """Collect metadata for a single cluster"""
+    def collect_cluster_metadata(self, project_id: str, cluster: Dict) -> List[Dict]:
+        """Collect metadata for a single cluster - returns one entry per electable node"""
         cluster_name = cluster["name"]
         print(f"    Collecting metadata for cluster: {cluster_name}")
         
-        # Start with basic cluster info
-        metadata = {
+        # Start with basic cluster info (shared across all nodes)
+        base_metadata = {
             "cluster_name": cluster_name,
             "cluster_id": cluster.get("id"),
             "cluster_type": cluster.get("clusterType"),
@@ -331,72 +533,50 @@ class AtlasMetadataCollector:
         # Extract provider settings
         provider_settings = cluster.get("providerSettings", {})
         if provider_settings:
-            metadata["provider"] = provider_settings.get("providerName")
-            metadata["region"] = provider_settings.get("regionName")
-            metadata["tier"] = provider_settings.get("instanceSizeName")
-            metadata["disk_size_gb"] = cluster.get("diskSizeGB")
+            base_metadata["provider"] = provider_settings.get("providerName")
+            base_metadata["region"] = provider_settings.get("regionName")
+            base_metadata["tier"] = provider_settings.get("instanceSizeName")
+            base_metadata["disk_size_gb"] = cluster.get("diskSizeGB")
         
         # Extract tier from replicationSpecs if not found
-        if not metadata.get("tier"):
+        if not base_metadata.get("tier"):
             replication_specs = cluster.get("replicationSpecs", [])
             if replication_specs and len(replication_specs) > 0:
                 regions_config = replication_specs[0].get("regionsConfig", {})
                 if regions_config:
                     first_config = list(regions_config.values())[0]
                     if "electableSpecs" in first_config and len(first_config["electableSpecs"]) > 0:
-                        metadata["tier"] = first_config["electableSpecs"][0].get("instanceSize", None)
+                        base_metadata["tier"] = first_config["electableSpecs"][0].get("instanceSize", None)
                     elif "readOnlySpecs" in first_config and len(first_config["readOnlySpecs"]) > 0:
-                        metadata["tier"] = first_config["readOnlySpecs"][0].get("instanceSize", None)
+                        base_metadata["tier"] = first_config["readOnlySpecs"][0].get("instanceSize", None)
                     elif "analyticsSpecs" in first_config and len(first_config["analyticsSpecs"]) > 0:
-                        metadata["tier"] = first_config["analyticsSpecs"][0].get("instanceSize", None)
+                        base_metadata["tier"] = first_config["analyticsSpecs"][0].get("instanceSize", None)
         
         # Get region from replicationSpecs if not already set
-        if not metadata.get("region"):
+        if not base_metadata.get("region"):
             replication_specs = cluster.get("replicationSpecs", [])
             if replication_specs and len(replication_specs) > 0:
                 regions_config = replication_specs[0].get("regionsConfig", {})
                 if regions_config:
                     first_region_key = list(regions_config.keys())[0] if regions_config else None
                     if first_region_key:
-                        metadata["region"] = first_region_key
+                        base_metadata["region"] = first_region_key
         
         # Get disk size if not already set
-        if not metadata.get("disk_size_gb"):
-            metadata["disk_size_gb"] = cluster.get("diskSizeGB")
+        if not base_metadata.get("disk_size_gb"):
+            base_metadata["disk_size_gb"] = cluster.get("diskSizeGB")
         
-        # Metrics fields (will be populated if metrics are available)
-        metadata.update({
-            "cpu_max_percent": None,
-            "cpu_avg_percent": None,
-            "memory_max_gb": None,
-            "memory_avg_gb": None,
-            "iops_max": None,
-            "iops_avg": None,
-            "connections_max": None,
-            "connections_avg": None,
-            "read_ops_max": None,
-            "read_ops_avg": None,
-            "write_ops_max": None,
-            "write_ops_avg": None,
-            "disk_usage_max_gb": None,
-            "disk_available_max_gb": None,
-            "low_memory_use": None,
-            "low_iops_use": None,
-            "low_cpu_use": None,
-            "low_disk_use": None,
-            "cpu_burstable_lower_tier": None,
-            "cpu_tier_limit": None,
-            "memory_tier_limit_gb": None,
-            "iops_tier_limit": None,
-        })
+        # Define electable node types
+        ELECTABLE_NODE_TYPES = {"REPLICA_PRIMARY", "REPLICA_SECONDARY", "SHARD_PRIMARY", "SHARD_SECONDARY"}
         
-        # Try to fetch metrics if available
+        # Try to fetch processes and collect metrics for each electable node
+        all_node_metadata = []
         try:
-            print(f"      Attempting to fetch metrics...")
+            print(f"      Fetching processes...")
             processes = self.client.get_processes(project_id)
             
             if processes:
-                # Match processes to this cluster using mongoURI and userAlias
+                # Match processes to this cluster
                 cluster_processes = []
                 mongo_uri = cluster.get("mongoURI", "")
                 
@@ -416,7 +596,6 @@ class AtlasMetadataCollector:
                 for p in processes:
                     hostname = p.get("hostname", "")
                     user_alias = p.get("userAlias", "")
-                    # Try multiple matching strategies
                     if hostname in uri_hostnames:
                         cluster_processes.append(p)
                         continue
@@ -426,188 +605,48 @@ class AtlasMetadataCollector:
                 
                 # If no matches, use cluster name pattern matching
                 if not cluster_processes:
-                    cluster_name = cluster.get("name", "")
                     for p in processes:
                         hostname = p.get("hostname", "")
                         if cluster_name.lower().replace("-", "").replace("_", "") in hostname.lower().replace("-", "").replace("_", ""):
                             cluster_processes.append(p)
                 
-                # Try to find the primary process
-                primary_process = None
-                for p in cluster_processes:
-                    if p.get("typeName") == "REPLICA_PRIMARY":
-                        primary_process = p
-                        break
+                # Filter to only electable nodes
+                electable_processes = [
+                    p for p in cluster_processes 
+                    if p.get("typeName") in ELECTABLE_NODE_TYPES
+                ]
                 
-                if not primary_process and cluster_processes:
-                    primary_process = cluster_processes[0]
+                electable_node_count = len(electable_processes)
+                print(f"      Found {electable_node_count} electable node(s)")
                 
-                if not primary_process:
-                    # Fallback to any primary in the project
-                    for p in processes:
-                        if p.get("typeName") == "REPLICA_PRIMARY":
-                            primary_process = p
-                            break
+                # Collect metrics for each electable node
+                for process in electable_processes:
+                    node_metadata = self._collect_node_metrics(project_id, process, base_metadata.copy())
+                    node_metadata["electable_node_count"] = electable_node_count
+                    all_node_metadata.append(node_metadata)
                 
-                if not primary_process and processes:
-                    primary_process = processes[0]
-                
-                process_id = primary_process["id"]
-                process_type = primary_process.get("typeName", "UNKNOWN")
-                print(f"      Using process: {primary_process.get('hostname')} ({process_type})")
-                
-                # Collect CPU metrics - sum multiple metrics
-                cpu_measurements = self.client.get_process_measurements(
-                    project_id, process_id, "CPU_USAGE", granularity="PT1M", period="P2D"
-                )
-                if cpu_measurements:
-                    cpu_metric_names = [
-                        "SYSTEM_NORMALIZED_CPU_GUEST", "SYSTEM_NORMALIZED_CPU_IOWAIT",
-                        "SYSTEM_NORMALIZED_CPU_IRQ", "SYSTEM_NORMALIZED_CPU_KERNEL",
-                        "SYSTEM_NORMALIZED_CPU_NICE", "SYSTEM_NORMALIZED_CPU_SOFTIRQ",
-                        "SYSTEM_NORMALIZED_CPU_STEAL", "SYSTEM_NORMALIZED_CPU_USER"
-                    ]
-                    cpu_metrics_to_sum = [
-                        m for m in cpu_measurements.get("measurements", [])
-                        if m.get("name") in cpu_metric_names
-                    ]
-                    if cpu_metrics_to_sum:
-                        stats = self.calculate_metric_stats_from_multiple(cpu_metrics_to_sum)
-                        if stats["max"] is not None:
-                            metadata["cpu_max_percent"] = stats["max"]
-                            metadata["cpu_avg_percent"] = stats["avg"]
-                
-                # Collect MEMORY metrics
-                memory_measurements = self.client.get_process_measurements(
-                    project_id, process_id, "MEMORY", granularity="PT1M", period="P2D"
-                )
-                if memory_measurements:
-                    for measurement in memory_measurements.get("measurements", []):
-                        metric_name = measurement.get("name")
-                        if metric_name == "SYSTEM_MEMORY_USED":
-                            stats = self.calculate_metric_stats_from_single(measurement)
-                            if stats["max"] is not None:
-                                # SYSTEM_MEMORY_USED is in KB, convert to GB
-                                metadata["memory_max_gb"] = round(stats["max"] / (1024**2), 2)
-                                metadata["memory_avg_gb"] = round(stats["avg"] / (1024**2), 2)
-                                break
-                
-                # Collect DISK and DATABASE_SIZE metrics
-                disk_measurements = self.client.get_process_measurements(
-                    project_id, process_id, "DISK", granularity="PT1M", period="P2D"
-                )
-                if disk_measurements:
-                    for measurement in disk_measurements.get("measurements", []):
-                        metric_name = measurement.get("name")
-                        if metric_name == "DB_STORAGE_TOTAL":
-                            stats = self.calculate_metric_stats_from_single(measurement)
-                            if stats["max"] is not None:
-                                # Convert bytes to GB
-                                metadata["disk_usage_max_gb"] = round(stats["max"] / (1024**3), 2)
-                                break
-                
-                # Try DATABASE_SIZE for DB_DATA_SIZE_TOTAL
-                db_size_measurements = self.client.get_process_measurements(
-                    project_id, process_id, "DATABASE_SIZE", granularity="PT1M", period="P2D"
-                )
-                if db_size_measurements:
-                    for measurement in db_size_measurements.get("measurements", []):
-                        metric_name = measurement.get("name")
-                        if metric_name == "DB_DATA_SIZE_TOTAL":
-                            stats = self.calculate_metric_stats_from_single(measurement)
-                            if stats["max"] is not None:
-                                # Convert bytes to GB
-                                if metadata.get("disk_usage_max_gb") is None:
-                                    metadata["disk_usage_max_gb"] = round(stats["max"] / (1024**3), 2)
-                                break
-                
-                # Collect IOPS metrics from v2 disk API
-                try:
-                    disks = self.client.get_disks(project_id, process_id)
-                    if disks:
-                        # Use the first disk partition
-                        disk = disks[0]
-                        partition_name = disk.get("partitionName")
-                        if partition_name:
-                            print(f"      Fetching IOPS from disk {partition_name}...")
-                            iops_measurements = self.client.get_disk_measurements(
-                                project_id, process_id, partition_name, granularity="PT1M", period="P2D"
-                            )
-                            if iops_measurements:
-                                for measurement in iops_measurements.get("measurements", []):
-                                    metric_name = measurement.get("name")
-                                    if metric_name == "DISK_PARTITION_IOPS_TOTAL":
-                                        stats = self.calculate_metric_stats_from_single(measurement)
-                                        if stats["max"] is not None:
-                                            metadata["iops_max"] = stats["max"]
-                                            metadata["iops_avg"] = stats["avg"]
-                                            break
-                except Exception as e:
-                    print(f"      Could not fetch IOPS metrics: {str(e)[:100]}")
-                
-                # Try DATABASE_OPERATIONS metrics for connections and operations
-                op_measurements = self.client.get_process_measurements(
-                    project_id, process_id, "DATABASE_OPERATIONS", granularity="PT1M", period="P2D"
-                )
-                if op_measurements:
-                    # Connections
-                    for measurement in op_measurements.get("measurements", []):
-                        metric_name = measurement.get("name")
-                        if metric_name == "CONNECTIONS":
-                            stats = self.calculate_metric_stats_from_single(measurement)
-                            if stats["max"] is not None:
-                                metadata["connections_max"] = stats["max"]
-                                metadata["connections_avg"] = stats["avg"]
-                                break
-                    
-                    # Read operations - sum multiple metrics
-                    read_op_metric_names = [
-                        "OPCOUNTER_CMD", "OPCOUNTER_GETMORE", "OPCOUNTER_QUERY"
-                    ]
-                    read_op_metrics_to_sum = [
-                        m for m in op_measurements.get("measurements", [])
-                        if m.get("name") in read_op_metric_names
-                    ]
-                    if read_op_metrics_to_sum:
-                        stats = self.calculate_metric_stats_from_multiple(read_op_metrics_to_sum)
-                        if stats["max"] is not None:
-                            metadata["read_ops_max"] = stats["max"]
-                            metadata["read_ops_avg"] = stats["avg"]
-                    
-                    # Write operations - sum multiple metrics
-                    write_op_metric_names = [
-                        "OPCOUNTER_DELETE", "OPCOUNTER_TTL_DELETED", "OPCOUNTER_INSERT", "OPCOUNTER_UPDATE"
-                    ]
-                    write_op_metrics_to_sum = [
-                        m for m in op_measurements.get("measurements", [])
-                        if m.get("name") in write_op_metric_names
-                    ]
-                    if write_op_metrics_to_sum:
-                        stats = self.calculate_metric_stats_from_multiple(write_op_metrics_to_sum)
-                        if stats["max"] is not None:
-                            metadata["write_ops_max"] = stats["max"]
-                            metadata["write_ops_avg"] = stats["avg"]
+                # Print summary of nodes collected for this cluster
+                print(f"      Collected metrics from {len(all_node_metadata)} node(s) for cluster {cluster_name}")
             
+            # If no electable nodes found, return base metadata with empty metrics
+            if not all_node_metadata:
+                metadata = base_metadata.copy()
+                metadata.update(self._empty_metrics_dict())
+                metadata["node_hostname"] = None
+                metadata["node_type"] = None
+                metadata["electable_node_count"] = 0
+                all_node_metadata.append(metadata)
+        
         except Exception as e:
-            print(f"      Metrics not available: {str(e)[:100]}")
+            print(f"      Error fetching processes: {str(e)[:100]}")
+            metadata = base_metadata.copy()
+            metadata.update(self._empty_metrics_dict())
+            metadata["node_hostname"] = None
+            metadata["node_type"] = None
+            metadata["electable_node_count"] = 0
+            all_node_metadata.append(metadata)
         
-        # Calculate disk available if we have both values
-        if metadata.get("disk_size_gb") and metadata.get("disk_usage_max_gb"):
-            metadata["disk_available_max_gb"] = round(
-                metadata["disk_size_gb"] - metadata["disk_usage_max_gb"], 2
-            )
-        
-        # Calculate low_disk_use: true if disk_usage_max_gb < disk_size_gb * 0.3
-        disk_usage_max = metadata.get("disk_usage_max_gb")
-        disk_size = metadata.get("disk_size_gb")
-        if disk_usage_max is not None and disk_size is not None:
-            metadata["low_disk_use"] = True if disk_usage_max < disk_size * 0.3 else None
-        
-        # Calculate usage flags
-        tier_specs = self.load_tier_specs()
-        metadata = self.calculate_usage_flags(metadata, tier_specs)
-        
-        return metadata
+        return all_node_metadata
     
     def collect_all_metadata(self) -> Dict:
         """Collect metadata for all projects and clusters"""
@@ -647,8 +686,9 @@ class AtlasMetadataCollector:
                     continue
                 
                 try:
-                    metadata = self.collect_cluster_metadata(project_id, cluster)
-                    cluster_metadata.append(metadata)
+                    # Now returns a list of node metadata entries
+                    node_metadata_list = self.collect_cluster_metadata(project_id, cluster)
+                    cluster_metadata.extend(node_metadata_list)
                 except Exception as e:
                     print(f"    Error collecting metadata for cluster {cluster.get('name')}: {e}")
             
@@ -780,61 +820,74 @@ Time filtering:
             with open(output_file, 'w', newline='') as f:
                 writer = csv.writer(f)
                 
-                # Write header
+                # Write header (includes node_hostname, node_type, electable_node_count, and p95 metrics)
                 writer.writerow([
                     'project_name', 'project_id', 'cluster_name', 'cluster_id',
+                    'node_hostname', 'node_type', 'electable_node_count',
                     'cluster_type', 'mongodb_version', 'state', 'provider', 'region',
                     'tier', 'disk_size_gb', 'created_at', 'updated_at',
-                    'cpu_max_percent', 'cpu_avg_percent', 'memory_max_gb', 'memory_avg_gb',
-                    'iops_max', 'iops_avg', 'connections_max', 'connections_avg',
-                    'read_ops_max', 'read_ops_avg', 'write_ops_max', 'write_ops_avg',
+                    'cpu_max_percent', 'cpu_avg_percent', 'cpu_p95_percent',
+                    'memory_max_gb', 'memory_avg_gb', 'memory_p95_gb',
+                    'iops_max', 'iops_avg', 'iops_p95',
+                    'connections_max', 'connections_avg', 'connections_p95',
+                    'read_ops_max', 'read_ops_avg', 'read_ops_p95',
+                    'write_ops_max', 'write_ops_avg', 'write_ops_p95',
                     'disk_usage_max_gb', 'disk_available_max_gb',
                     'cpu_tier_limit', 'memory_tier_limit_gb', 'iops_tier_limit',
                     'low_cpu_use', 'low_memory_use', 'low_iops_use', 'low_disk_use', 'cpu_burstable_lower_tier'
                 ])
                 
-                # Write cluster data
+                # Write node data (each row is now a node within a cluster)
                 for project in results["projects"]:
                     project_name = project["project_name"]
                     project_id = project["project_id"]
                     
-                    for cluster in project["clusters"]:
+                    for node in project["clusters"]:
                         writer.writerow([
                             project_name,
                             project_id,
-                            cluster.get("cluster_name"),
-                            cluster.get("cluster_id"),
-                            cluster.get("cluster_type"),
-                            cluster.get("mongodb_version"),
-                            cluster.get("state"),
-                            cluster.get("provider"),
-                            cluster.get("region"),
-                            cluster.get("tier"),
-                            cluster.get("disk_size_gb"),
-                            cluster.get("created_at"),
-                            cluster.get("updated_at"),
-                            cluster.get("cpu_max_percent"),
-                            cluster.get("cpu_avg_percent"),
-                            cluster.get("memory_max_gb"),
-                            cluster.get("memory_avg_gb"),
-                            cluster.get("iops_max"),
-                            cluster.get("iops_avg"),
-                            cluster.get("connections_max"),
-                            cluster.get("connections_avg"),
-                            cluster.get("read_ops_max"),
-                            cluster.get("read_ops_avg"),
-                            cluster.get("write_ops_max"),
-                            cluster.get("write_ops_avg"),
-                            cluster.get("disk_usage_max_gb"),
-                            cluster.get("disk_available_max_gb"),
-                            cluster.get("cpu_tier_limit"),
-                            cluster.get("memory_tier_limit_gb"),
-                            cluster.get("iops_tier_limit"),
-                            cluster.get("low_cpu_use"),
-                            cluster.get("low_memory_use"),
-                            cluster.get("low_iops_use"),
-                            cluster.get("low_disk_use"),
-                            cluster.get("cpu_burstable_lower_tier")
+                            node.get("cluster_name"),
+                            node.get("cluster_id"),
+                            node.get("node_hostname"),
+                            node.get("node_type"),
+                            node.get("electable_node_count"),
+                            node.get("cluster_type"),
+                            node.get("mongodb_version"),
+                            node.get("state"),
+                            node.get("provider"),
+                            node.get("region"),
+                            node.get("tier"),
+                            node.get("disk_size_gb"),
+                            node.get("created_at"),
+                            node.get("updated_at"),
+                            node.get("cpu_max_percent"),
+                            node.get("cpu_avg_percent"),
+                            node.get("cpu_p95_percent"),
+                            node.get("memory_max_gb"),
+                            node.get("memory_avg_gb"),
+                            node.get("memory_p95_gb"),
+                            node.get("iops_max"),
+                            node.get("iops_avg"),
+                            node.get("iops_p95"),
+                            node.get("connections_max"),
+                            node.get("connections_avg"),
+                            node.get("connections_p95"),
+                            node.get("read_ops_max"),
+                            node.get("read_ops_avg"),
+                            node.get("read_ops_p95"),
+                            node.get("write_ops_max"),
+                            node.get("write_ops_avg"),
+                            node.get("write_ops_p95"),
+                            node.get("disk_usage_max_gb"),
+                            node.get("disk_available_max_gb"),
+                            node.get("cpu_tier_limit"),
+                            node.get("memory_tier_limit_gb"),
+                            node.get("iops_tier_limit"),
+                            node.get("low_cpu_use"),
+                            node.get("low_memory_use"),
+                            node.get("low_iops_use"),
+                            node.get("low_disk_use"),
+                            node.get("cpu_burstable_lower_tier")
                         ])
         else:
             # Default to JSON if extension is not recognized
@@ -843,8 +896,15 @@ Time filtering:
         
         print(f"\nResults written to: {output_file}")
         
-        total_clusters = sum(len(p["clusters"]) for p in results["projects"])
-        print(f"Total clusters processed: {total_clusters}")
+        # Count unique clusters by tracking cluster_ids
+        cluster_ids = set()
+        total_nodes = 0
+        for project in results["projects"]:
+            for node in project["clusters"]:
+                cluster_ids.add(node.get("cluster_id"))
+                total_nodes += 1
+        print(f"Total clusters processed: {len(cluster_ids)}")
+        print(f"Total nodes processed: {total_nodes}")
         
     except Exception as e:
         print(f"Error: {e}")
