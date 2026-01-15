@@ -297,10 +297,12 @@ class AtlasMetadataCollector:
             "low_iops_use": None,
             "low_cpu_use": None,
             "low_disk_use": None,
+            "low_connections_use": None,
             "cpu_burstable_lower_tier": None,
             "cpu_tier_limit": None,
             "memory_tier_limit_gb": None,
             "iops_tier_limit": None,
+            "connections_tier_limit": None,
         }
     
     def _collect_node_metrics(self, project_id: str, process: Dict, metadata: Dict) -> Dict:
@@ -481,6 +483,7 @@ class AtlasMetadataCollector:
         ram_limit = spec.get("ram")
         iops_limit = spec.get("iops")
         cpu_limit = spec.get("cpu")
+        connections_limit = spec.get("connection")
         
         # Set tier limits
         if ram_limit:
@@ -489,6 +492,8 @@ class AtlasMetadataCollector:
             metadata["iops_tier_limit"] = iops_limit
         if cpu_limit:
             metadata["cpu_tier_limit"] = cpu_limit
+        if connections_limit:
+            metadata["connections_tier_limit"] = connections_limit
         
         # Calculate low_memory_use: true if memory_max_gb < memory_tier_limit_gb * 0.75
         memory_max = metadata.get("memory_max_gb")
@@ -511,6 +516,11 @@ class AtlasMetadataCollector:
             else:
                 metadata["low_cpu_use"] = True if cpu_p95 < 37 else None
                 metadata["cpu_burstable_lower_tier"] = False
+
+        # Calculate low_connections_use: true if connections_max < 0.5 * connections_tier_limit
+        connections_max = metadata.get("connections_max")
+        if connections_max is not None and connections_limit:
+            metadata["low_connections_use"] = True if connections_max < connections_limit * 0.5 else None
         
         return metadata
     
@@ -833,8 +843,8 @@ Time filtering:
                     'read_ops_max', 'read_ops_avg', 'read_ops_p95',
                     'write_ops_max', 'write_ops_avg', 'write_ops_p95',
                     'disk_usage_max_gb', 'disk_available_max_gb',
-                    'cpu_tier_limit', 'memory_tier_limit_gb', 'iops_tier_limit',
-                    'low_cpu_use', 'low_memory_use', 'low_iops_use', 'low_disk_use', 'cpu_burstable_lower_tier'
+                    'cpu_tier_limit', 'memory_tier_limit_gb', 'iops_tier_limit', 'connections_tier_limit',
+                    'low_cpu_use', 'low_memory_use', 'low_iops_use', 'low_disk_use', 'low_connections_use', 'cpu_burstable_lower_tier'
                 ])
                 
                 # Write node data (each row is now a node within a cluster)
@@ -883,10 +893,12 @@ Time filtering:
                             node.get("cpu_tier_limit"),
                             node.get("memory_tier_limit_gb"),
                             node.get("iops_tier_limit"),
+                            node.get("connections_tier_limit"),
                             node.get("low_cpu_use"),
                             node.get("low_memory_use"),
                             node.get("low_iops_use"),
                             node.get("low_disk_use"),
+                            node.get("low_connections_use"),
                             node.get("cpu_burstable_lower_tier")
                         ])
         else:
